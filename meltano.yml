@@ -1,0 +1,37 @@
+send_anonymous_usage_stats: true
+project_id: "target-pgvector"
+default_environment: test
+requires_meltano: ">=4.0"
+environments:
+- name: test
+plugins:
+  extractors:
+  - name: tap-smoke-test
+    variant: meltano
+    pip_url: git+https://github.com/meltano/tap-smoke-test.git
+    config:
+      streams:
+      - stream_name: content
+        input_filename: /home/pdharma/Git/meltano-dev/tap-confluence/output/content.jsonl
+
+  loaders:
+  - name: "target-pgvector"
+    namespace: "target_pgvector"
+    pip_url: -e .
+    capabilities:
+    - about
+    - stream-maps
+    - schema-flattening
+    - structured-logging
+
+    config:
+     host: localhost
+     port: 5432
+     database: postgres
+     user: postgres
+     embeddings_table: embeddings
+     embeddings_model: sentence-transformers/all-mpnet-base-v2
+
+    # TODO: Declare required settings here:
+    settings_group_validation:
+    - [token]

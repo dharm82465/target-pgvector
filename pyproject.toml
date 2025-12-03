@@ -24,11 +24,10 @@ requires-python = ">=3.10"
 dependencies = [
     "singer-sdk~=0.53.3",
     "requests~=2.32.3",
+    "psycopg2-binary",
     "docling",
     "transformers",
     "sentence-transformers",
-    "pandas",
-    "timescale-vector",
 ]
 
 [project.optional-dependencies]

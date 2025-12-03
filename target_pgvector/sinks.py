@@ -43,9 +43,10 @@ class TargetPGVector(BatchSink):
         self.embeddings_table = self.config.get("embeddings_table") or os.environ.get(
             "PGVECTOR_EMBEDDINGS_TABLE"
         )
-        self.embeddings_model = SentenceTransformer(
-            target.config.get("embeddings_model") or os.environ.get("PGVECTOR_EMBEDDINGS_MODEL")
+        self.embeddings_model_name = self.config.get("embeddings_model") or os.environ.get(
+            "PGVECTOR_EMBEDDINGS_MODEL"
         )
+        self.embeddings_model = SentenceTransformer(self.embeddings_model_name, device="cuda")
         try:
             conn = psycopg2.connect(
                 host=target.config.get("host") or os.environ.get("PGVECTOR_HOST"),
@@ -58,9 +59,7 @@ class TargetPGVector(BatchSink):
             self.connection = conn
             self.chunker = HybridChunker(
                 tokenizer=HuggingFaceTokenizer(
-                    tokenizer=AutoTokenizer.from_pretrained(
-                        self.embeddings_model.model_name_or_path
-                    ),
+                    tokenizer=AutoTokenizer.from_pretrained(self.embeddings_model_name),
                     merge_peers=True,
                 )
             )
@@ -73,6 +72,7 @@ class TargetPGVector(BatchSink):
         if self.connection:
             cursor = self.connection.cursor()
             create_table_query = f"""
+            CREATE EXTENSION IF NOT EXISTS vector;
             CREATE TABLE IF NOT EXISTS {self.stream_name} (
                 id BIGINT PRIMARY KEY,
                 title TEXT,
@@ -87,6 +87,7 @@ class TargetPGVector(BatchSink):
                 chunk_index INT NOT NULL,
                 chunk_text TEXT NOT NULL,
                 metadata JSONB,  -- chunk-level metadata only
+                embeddings vector({self.embeddings_model.get_sentence_embedding_dimension()}),
                 UNIQUE(document_id, chunk_index)
             );
             """
@@ -152,8 +153,8 @@ class TargetPGVector(BatchSink):
                 }
 
                 insert_query = sql.SQL(
-                    "INSERT INTO {} (document_id, chunk_index, chunk_text, metadata) "
-                    "VALUES (%s, %s, %s, %s) "
+                    "INSERT INTO {} (document_id, chunk_index, chunk_text, metadata, embeddings) "
+                    "VALUES (%s, %s, %s, %s, %s) "
                     "ON CONFLICT (document_id, chunk_index) DO UPDATE SET "
                     "chunk_text = EXCLUDED.chunk_text, metadata = EXCLUDED.metadata"
                 ).format(sql.Identifier(self.embeddings_table))
@@ -164,6 +165,7 @@ class TargetPGVector(BatchSink):
                         i,
                         chunk.text,
                         json.dumps(metadata),
+                        json.dumps(self.embeddings_model.encode(chunk.text).tolist()),
                     ),
                 )
         cur.close()
