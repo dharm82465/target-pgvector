@@ -72,7 +72,6 @@ class TargetPGVector(BatchSink):
         if self.connection:
             cursor = self.connection.cursor()
             create_table_query = f"""
-            CREATE EXTENSION IF NOT EXISTS vector;
             CREATE TABLE IF NOT EXISTS {self.stream_name} (
                 id BIGINT PRIMARY KEY,
                 title TEXT,
@@ -90,6 +89,7 @@ class TargetPGVector(BatchSink):
                 embeddings vector({self.embeddings_model.get_sentence_embedding_dimension()}),
                 UNIQUE(document_id, chunk_index)
             );
+            CREATE INDEX ON {self.embeddings_table} USING hnsw (embeddings vector_l2_ops);
             """
             cursor.execute(create_table_query)
             cursor.close()
