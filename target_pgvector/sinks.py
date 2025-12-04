@@ -7,6 +7,7 @@ import os
 from typing import TYPE_CHECKING
 
 import psycopg2
+import torch
 from docling.chunking import HybridChunker
 from docling.datamodel.base_models import InputFormat
 from docling.document_converter import DocumentConverter
@@ -46,7 +47,14 @@ class TargetPGVector(BatchSink):
         self.embeddings_model_name = self.config.get("embeddings_model") or os.environ.get(
             "PGVECTOR_EMBEDDINGS_MODEL"
         )
-        self.embeddings_model = SentenceTransformer(self.embeddings_model_name, device="cuda")
+        device = (
+            torch.device("cuda")
+            if torch.cuda.is_available()
+            else torch.device("mps")
+            if torch.backends.mps.is_available()
+            else torch.device("cpu")
+        )
+        self.embeddings_model = SentenceTransformer(self.embeddings_model_name, device=device)
         try:
             conn = psycopg2.connect(
                 host=target.config.get("host") or os.environ.get("PGVECTOR_HOST"),
