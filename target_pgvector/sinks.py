@@ -47,6 +47,7 @@ class TargetPGVector(BatchSink):
         self.embeddings_model_name = self.config.get("embeddings_model") or os.environ.get(
             "PGVECTOR_EMBEDDINGS_MODEL"
         )
+        hf_token = self.config.get("hf_token") or os.environ.get("PGVECTOR_HF_TOKEN")
         device = (
             torch.device("cuda")
             if torch.cuda.is_available()
@@ -54,7 +55,9 @@ class TargetPGVector(BatchSink):
             if torch.backends.mps.is_available()
             else torch.device("cpu")
         )
-        self.embeddings_model = SentenceTransformer(self.embeddings_model_name, device=device)
+        self.embeddings_model = SentenceTransformer(
+            self.embeddings_model_name, device=device, token=hf_token
+        )
         try:
             conn = psycopg2.connect(
                 host=target.config.get("host") or os.environ.get("PGVECTOR_HOST"),
@@ -67,7 +70,9 @@ class TargetPGVector(BatchSink):
             self.connection = conn
             self.chunker = HybridChunker(
                 tokenizer=HuggingFaceTokenizer(
-                    tokenizer=AutoTokenizer.from_pretrained(self.embeddings_model_name),
+                    tokenizer=AutoTokenizer.from_pretrained(
+                        self.embeddings_model_name, token=hf_token
+                    ),
                     merge_peers=True,
                 )
             )
