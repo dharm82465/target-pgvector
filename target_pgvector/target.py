@@ -54,12 +54,20 @@ class TargetPGVector(Target):
             description="The database name for the PGVector database",
         ),
         th.Property(
-            "embeddings_table",
+            "document_stream_name",
             th.StringType(nullable=False),
             secret=False,
             required=True,
-            title="Embeddings Table",
-            description="The embeddings table name for the PGVector database",
+            title="Document Stream Name",
+            description="The document stream name for the PGVector database",
+        ),
+        th.Property(
+            "document_text_properties",
+            th.ArrayType(th.StringType(), nullable=False),
+            secret=False,
+            required=True,
+            title="Document Text Properties",
+            description="The document text properties for the PGVector database",
         ),
         th.Property(
             "hf_token",
