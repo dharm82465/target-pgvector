@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from multiprocessing import context
 from typing import TYPE_CHECKING
 
 import psycopg2
@@ -41,12 +42,16 @@ class TargetPGVector(BatchSink):
             key_properties: Primary key properties.
         """
         super().__init__(target, stream_name, schema, key_properties)
-        self.embeddings_table = self.config.get("embeddings_table") or os.environ.get(
-            "PGVECTOR_EMBEDDINGS_TABLE"
+        self.document_stream_name = self.config.get("document_stream_name") or os.environ.get(
+            "PGVECTOR_DOCUMENT_STREAM_NAME"
         )
         self.embeddings_model_name = self.config.get("embeddings_model") or os.environ.get(
             "PGVECTOR_EMBEDDINGS_MODEL"
         )
+        self.document_text_properties = self.config.get(
+            "document_text_properties"
+        ) or os.environ.get("PGVECTOR_DOCUMENT_TEXT_PROPERTIES")
+        hf_token = self.config.get("hf_token") or os.environ.get("PGVECTOR_HF_TOKEN")
         device = (
             torch.device("cuda")
             if torch.cuda.is_available()
@@ -54,7 +59,9 @@ class TargetPGVector(BatchSink):
             if torch.backends.mps.is_available()
             else torch.device("cpu")
         )
-        self.embeddings_model = SentenceTransformer(self.embeddings_model_name, device=device)
+        self.embeddings_model = SentenceTransformer(
+            self.embeddings_model_name, device=device, token=hf_token
+        )
         try:
             conn = psycopg2.connect(
                 host=target.config.get("host") or os.environ.get("PGVECTOR_HOST"),
@@ -67,7 +74,9 @@ class TargetPGVector(BatchSink):
             self.connection = conn
             self.chunker = HybridChunker(
                 tokenizer=HuggingFaceTokenizer(
-                    tokenizer=AutoTokenizer.from_pretrained(self.embeddings_model_name),
+                    tokenizer=AutoTokenizer.from_pretrained(
+                        self.embeddings_model_name, token=hf_token
+                    ),
                     merge_peers=True,
                 )
             )
@@ -75,33 +84,53 @@ class TargetPGVector(BatchSink):
             self.logger.exception("Error connecting to database")
 
     def setup(self) -> None:
-        """Set up the sink by creating necessary tables."""
+        """Set up the sink by creating necessary tables based on schema."""
         super().setup()
-        if self.connection:
+        if self.connection and self.document_stream_name == self.stream_name:
             cursor = self.connection.cursor()
-            create_table_query = f"""
-            CREATE TABLE IF NOT EXISTS {self.stream_name} (
-                id BIGINT PRIMARY KEY,
-                title TEXT,
-                type TEXT,
-                author TEXT,
-                url TEXT,
-                last_modified TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS {self.embeddings_table} (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                document_id BIGINT NOT NULL REFERENCES {self.stream_name}(id) ON DELETE CASCADE,
-                chunk_index INT NOT NULL,
-                chunk_text TEXT NOT NULL,
-                metadata JSONB,  -- chunk-level metadata only
-                embeddings vector({self.embeddings_model.get_sentence_embedding_dimension()}),
-                UNIQUE(document_id, chunk_index)
-            );
-            CREATE INDEX ON {self.embeddings_table} USING hnsw (embeddings vector_l2_ops);
-            """
+
+            # Build columns from schema
+            columns = self._build_columns_from_schema()
+
+            # Create main table
+            create_table_query = sql.SQL("CREATE TABLE IF NOT EXISTS {} ({})").format(
+                sql.Identifier(self.stream_name), sql.SQL(", ").join(columns)
+            )
             cursor.execute(create_table_query)
+
+            create_embeddings_query = sql.SQL("""
+                CREATE TABLE IF NOT EXISTS {} (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    document_id INT NOT NULL REFERENCES {}(id) ON DELETE CASCADE,
+                    chunk_index INT NOT NULL,
+                    chunk_text TEXT NOT NULL,
+                    metadata JSONB,
+                    embeddings vector({}),
+                    UNIQUE(document_id, chunk_index)
+                )
+            """).format(
+                sql.Identifier(self.document_stream_name + "_embeddings"),
+                sql.Identifier(self.stream_name),
+                sql.Literal(self.embeddings_model.get_sentence_embedding_dimension()),
+            )
+            cursor.execute(create_embeddings_query)
+
+            # Create index
+            create_index_query = sql.SQL(
+                "CREATE INDEX IF NOT EXISTS {} ON {} USING hnsw (embeddings vector_l2_ops)"
+            ).format(
+                sql.Identifier(f"{self.document_stream_name}_embeddings_idx"),
+                sql.Identifier(self.document_stream_name + "_embeddings"),
+            )
+            cursor.execute(create_index_query)
+
             cursor.close()
-            self.logger.info("Table '%s' is set up.", self.stream_name)
+            self.logger.info("Tables created for stream '%s'", self.stream_name)
+        else:
+            self.logger.warning(
+                "Skipping table creation for stream '%s' as it does not match document_stream_name",
+                self.stream_name,
+            )
 
     def clean_up(self) -> None:
         """Finalize the sink by closing the database connection."""
@@ -119,40 +148,51 @@ class TargetPGVector(BatchSink):
         self.logger.info("Starting new batch: %s", context["batch_id"])
 
     def process_batch(self, context: dict) -> None:
-        """Write out any prepped records and return once fully written.
-
-        Args:
-            context: Stream partition or context dictionary.
-        """
+        """Write records dynamically based on schema."""
         records_to_drain = context["records"]
         cur = self.connection.cursor()
+
         for record in records_to_drain:
-            self.logger.info("Processing record: %s", record["title"])
-            query = sql.SQL(
-                "INSERT INTO {} (id, title, type, author, url, last_modified) "
-                "VALUES (%s, %s, %s, %s, %s, %s) "
-                "ON CONFLICT (id) DO UPDATE SET "
-                "title = EXCLUDED.title, type = EXCLUDED.type, "
-                "author = EXCLUDED.author, url = EXCLUDED.url, "
-                "last_modified = EXCLUDED.last_modified"
-            ).format(sql.Identifier(self.stream_name))
-            cur.execute(
-                query,
-                (
-                    record["id"],
-                    record["title"],
-                    record["type"],
-                    record["author"],
-                    record["url"],
-                    record["last_modified"],
-                ),
+            # Build dynamic insert
+            fields = list(record.keys())
+            values = [record[f] for f in fields]
+
+            if len(self.key_properties) > 0:
+                query = sql.SQL(
+                    "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {}"
+                ).format(
+                    sql.Identifier(self.stream_name),
+                    sql.SQL(", ").join(sql.Identifier(f) for f in fields),
+                    sql.SQL(", ").join(sql.Placeholder() * len(fields)),
+                    sql.SQL(", ").join(sql.Identifier(k) for k in self.key_properties),
+                    sql.SQL(", ").join(
+                        sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(f), sql.Identifier(f))
+                        for f in fields
+                        if f not in self.key_properties
+                    ),
+                )
+            else:
+                query = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
+                    sql.Identifier(self.stream_name),
+                    sql.SQL(", ").join(sql.Identifier(f) for f in fields),
+                    sql.SQL(", ").join(sql.Placeholder() * len(fields)),
+                )
+
+            cur.execute(query, values)
+
+            # Process document chunks and embeddings
+
+            text = "<br/>".join(
+                f"<h1>{prop.capitalize()}</h1>\n<p>{record[prop]}</p>" if record[prop] else ""
+                for prop in self.document_text_properties
+                if prop in record
             )
-            document = self.converter.convert_string(record["value"], InputFormat.MD)
+
+            document = self.converter.convert_string(text, InputFormat.HTML)
             chunk_iter = self.chunker.chunk(dl_doc=document.document)
             chunks = list(chunk_iter)
             for i, chunk in enumerate(chunks):
                 metadata = {
-                    "filename": chunk.meta.origin.filename,
                     "page_numbers": sorted(
                         {prov.page_no for item in chunk.meta.doc_items for prov in item.prov}
                     )
@@ -165,7 +205,7 @@ class TargetPGVector(BatchSink):
                     "VALUES (%s, %s, %s, %s, %s) "
                     "ON CONFLICT (document_id, chunk_index) DO UPDATE SET "
                     "chunk_text = EXCLUDED.chunk_text, metadata = EXCLUDED.metadata"
-                ).format(sql.Identifier(self.embeddings_table))
+                ).format(sql.Identifier(self.document_stream_name + "_embeddings"))
                 cur.execute(
                     insert_query,
                     (
@@ -178,3 +218,80 @@ class TargetPGVector(BatchSink):
                 )
         cur.close()
         self.logger.info("Batch %s processed.", context["batch_id"])
+
+    def _build_columns_from_schema(self) -> list:
+        """Build PostgreSQL column definitions from JSON schema.
+
+        Returns:
+            List of SQL column definitions.
+        """
+        columns = []
+        properties = self.schema.get("properties", {})
+
+        for field_name, field_schema in properties.items():
+            pg_type = self._jsonschema_type_to_postgres(field_schema)
+            is_nullable = self._is_nullable(field_schema)
+            is_key = field_name in self.key_properties
+
+            column_def = sql.SQL("{} {}").format(sql.Identifier(field_name), sql.SQL(pg_type))
+
+            if is_key:
+                column_def = sql.SQL("{} PRIMARY KEY").format(column_def)
+            elif not is_nullable:
+                column_def = sql.SQL("{} NOT NULL").format(column_def)
+
+            columns.append(column_def)
+
+        return columns
+
+    def _jsonschema_type_to_postgres(self, field_schema: dict) -> str:
+        """Convert JSON Schema type to PostgreSQL type.
+
+        Args:
+            field_schema: The JSON schema for a field.
+
+        Returns:
+            PostgreSQL type string.
+        """
+        json_type = field_schema.get("type", [])
+
+        # Handle arrays like ["string", "null"]
+        if isinstance(json_type, list):
+            json_type = [t for t in json_type if t != "null"]
+            json_type = json_type[0] if json_type else "string"
+
+        format_type = field_schema.get("format")
+
+        # Map JSON Schema types to PostgreSQL types
+        if format_type == "date-time":
+            return "TIMESTAMP"
+        elif format_type == "date":
+            return "DATE"
+        elif format_type == "time":
+            return "TIME"
+        elif json_type == "integer":
+            return "BIGINT"
+        elif json_type == "number":
+            return "NUMERIC"
+        elif json_type == "boolean":
+            return "BOOLEAN"
+        elif json_type == "object" or json_type == "array":
+            return "JSONB"
+        else:
+            return "TEXT"
+
+    def _is_nullable(self, field_schema: dict) -> bool:
+        """Check if a field is nullable.
+
+        Args:
+            field_schema: The JSON schema for a field.
+
+        Returns:
+            True if the field is nullable.
+        """
+        json_type = field_schema.get("type", [])
+
+        if isinstance(json_type, list):
+            return "null" in json_type
+
+        return False
