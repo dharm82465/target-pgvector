@@ -25,9 +25,9 @@ dependencies = [
     "singer-sdk~=0.53.3",
     "requests~=2.32.3",
     "psycopg2-binary",
-    "docling~=2.66.0",
-    "transformers~=4.57.3",
-    "openai~=2.14.0",
+    "docling",
+    "transformers",
+    "sentence-transformers",
 ]
 
 [project.optional-dependencies]
@@ -57,21 +57,18 @@ packages = [
     "target_pgvector",
 ]
 
+
+[tool.poetry.dependencies]
+python = "^3.13"
+torch = [
+  {url = "https://download.pytorch.org/whl/torch/cpu"}
+]
+
 [tool.pytest]
 minversion = "9.0"
 addopts = [
     "--durations=10",
 ]
-
-[[tool.poetry.source]]
-name = "pytorch_cpu"
-url = "https://download.pytorch.org/whl/cpu"
-priority = "explicit"
-
-[tool.poetry.dependencies]
-docling = "~=2.66.0"
-transformers = "~=4.57.3"
-openai = "~=2.14.0"
 
 [tool.mypy]
 warn_unused_configs = true
