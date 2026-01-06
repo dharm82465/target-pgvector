@@ -8,13 +8,12 @@ from multiprocessing import context
 from typing import TYPE_CHECKING
 
 import psycopg2
-import torch
 from docling.chunking import HybridChunker
 from docling.datamodel.base_models import InputFormat
 from docling.document_converter import DocumentConverter
 from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
+from openai import OpenAI
 from psycopg2 import sql
-from sentence_transformers import SentenceTransformer
 from singer_sdk.sinks import BatchSink
 from transformers import AutoTokenizer
 
@@ -48,19 +47,19 @@ class TargetPGVector(BatchSink):
         self.embeddings_model_name = self.config.get("embeddings_model") or os.environ.get(
             "PGVECTOR_EMBEDDINGS_MODEL"
         )
+
         self.document_text_properties = self.config.get(
             "document_text_properties"
         ) or os.environ.get("PGVECTOR_DOCUMENT_TEXT_PROPERTIES")
-        hf_token = self.config.get("hf_token") or os.environ.get("PGVECTOR_HF_TOKEN")
-        device = (
-            torch.device("cuda")
-            if torch.cuda.is_available()
-            else torch.device("mps")
-            if torch.backends.mps.is_available()
-            else torch.device("cpu")
+
+        self.embedding_dimension = self.config.get("embeddings_dimension") or os.environ.get(
+            "PGVECTOR_EMBEDDINGS_DIMENSION"
         )
-        self.embeddings_model = SentenceTransformer(
-            self.embeddings_model_name, device=device, token=hf_token
+
+        self.openaiclient = OpenAI(
+            base_url=self.config.get("openai_base_url")
+            or os.environ.get("PGVECTOR_OPENAI_BASE_URL"),
+            api_key=self.config.get("openai_api_key") or os.environ.get("PGVECTOR_OPENAI_API_KEY"),
         )
         try:
             conn = psycopg2.connect(
@@ -75,7 +74,9 @@ class TargetPGVector(BatchSink):
             self.chunker = HybridChunker(
                 tokenizer=HuggingFaceTokenizer(
                     tokenizer=AutoTokenizer.from_pretrained(
-                        self.embeddings_model_name, token=hf_token
+                        self.embeddings_model_name
+                        if self.embeddings_model_name != "all-mpnet-base-v2"
+                        else "sentence-transformers/all-mpnet-base-v2"
                     ),
                     merge_peers=True,
                 )
@@ -111,7 +112,7 @@ class TargetPGVector(BatchSink):
             """).format(
                 sql.Identifier(self.document_stream_name + "_embeddings"),
                 sql.Identifier(self.stream_name),
-                sql.Literal(self.embeddings_model.get_sentence_embedding_dimension()),
+                sql.Literal(self.embedding_dimension),
             )
             cursor.execute(create_embeddings_query)
 
@@ -213,7 +214,13 @@ class TargetPGVector(BatchSink):
                         i,
                         chunk.text,
                         json.dumps(metadata),
-                        json.dumps(self.embeddings_model.encode(chunk.text).tolist()),
+                        json.dumps(
+                            self.openaiclient.embeddings.create(
+                                model=self.embeddings_model_name, input=chunk.text
+                            )
+                            .data[0]
+                            .embedding
+                        ),
                     ),
                 )
         cur.close()
