@@ -28,6 +28,7 @@ dependencies = [
     "docling",
     "transformers",
     "sentence-transformers",
+    "openai",
 ]
 
 [project.optional-dependencies]
